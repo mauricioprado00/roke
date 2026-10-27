@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""roke: a rofi front-end for KeePass databases. See specs.md.
+
+Escape always goes back one menu; at the database list it exits.
+"""
+
+import base64
+import hashlib
+import html
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+# KeePassXC's default Auto-Type delays, in milliseconds (specs.md §2.5.1).
+AUTOTYPE_START_DELAY_MS = 500
+AUTOTYPE_KEY_DELAY_MS = 25
+
+RECENT_DATABASES = "recent-databases"
+RECENT_DIRECTORIES = "recent-directories"
+RECENT_LIMIT = 30
+
+CHOOSE = "Choose…"
+ACTIONS = ("Autotype", "Copy password", "View notes")
+
+# XDG user directories offered as starting places, with their usual names.
+XDG_PLACES = {
+    "DESKTOP": "Desktop",
+    "DOCUMENTS": "Documents",
+    "DOWNLOAD": "Downloads",
+    "MUSIC": "Music",
+    "PICTURES": "Pictures",
+    "VIDEOS": "Videos",
+}
+
+
+class Failure(Exception):
+    """An error to show the user before exiting."""
+
+
+class Quit(Exception):
+    """The user chose to abort."""
+
+
+# --- persisted plain-text state (specs.md §3.2) ---------------------------
+
+
+def config_dir() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(base) / "roke"
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def read_recent(name: str) -> list[str]:
+    try:
+        text = (config_dir() / name).read_text()
+    except FileNotFoundError:
+        return []
+    return [line for line in text.splitlines() if line]
+
+
+def push_recent(name: str, item: str) -> None:
+    items = [item] + [i for i in read_recent(name) if i != item]
+    write_atomic(config_dir() / name, ("\n".join(items[:RECENT_LIMIT]) + "\n").encode())
+
+
+# --- rofi ------------------------------------------------------------------
+
+
+def clean(text: str) -> str:
+    """Make text safe to use as a single rofi row."""
+    return text.replace("\n", " ").replace("\0", "").replace("\x1f", "")
+
+
+def rofi(prompt, rows=(), *, mesg=None, meta=None, password=False):
+    """Show a rofi menu over stdin; nothing is passed on the command line or
+    written to disk. Returns the selected row's index, or the typed text for
+    a password prompt, or None when the user presses Escape."""
+    cmd = ["rofi", "-dmenu", "-i", "-p", prompt]
+    if mesg:
+        cmd += ["-mesg", html.escape(mesg)]
+    if password:
+        cmd += ["-password", "-theme-str", "listview { enabled: false; }"]
+    else:
+        cmd += ["-format", "i", "-no-custom", "-matching", "fuzzy"]
+    lines = []
+    for i, row in enumerate(rows):
+        line = clean(row)
+        if meta:
+            line += "\0meta\x1f" + clean(meta[i])
+        lines.append(line)
+    proc = subprocess.run(cmd, input="\n".join(lines), capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.rstrip("\n")
+    return out if password else int(out)
+
+
+def show_error(message: str) -> None:
+    if shutil.which("rofi"):
+        subprocess.run(["rofi", "-e", message])
+    else:
+        print(f"roke: {message}", file=sys.stderr)
+
+
+def require(command: str) -> None:
+    if not shutil.which(command):
+        raise Failure(f"{command} is not installed.")
+
+
+def tilde(path) -> str:
+    path, home = str(path), str(Path.home())
+    if path == home or path.startswith(home + "/"):
+        return "~" + path[len(home):]
+    return path
+
+
+# --- database selection and directory browser (specs.md §2.1, §2.2) -------
+
+
+def unique_dirs(paths) -> list[Path]:
+    return [p for p in dict.fromkeys(Path(p) for p in paths) if p.is_dir()]
+
+
+def common_places() -> list[Path]:
+    """Home, the XDG user directories and /, as a file manager's places."""
+    home = Path.home()
+    places = {key: home / name for key, name in XDG_PLACES.items()}
+    base = os.environ.get("XDG_CONFIG_HOME") or home / ".config"
+    try:
+        text = (Path(base) / "user-dirs.dirs").read_text()
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        key = key.strip().removeprefix("XDG_").removesuffix("_DIR")
+        if sep and key in places:
+            places[key] = Path(value.strip().strip('"').replace("$HOME", str(home)))
+    return unique_dirs([home, *places.values(), "/"])
+
+
+def list_directory(directory: Path) -> tuple[list[Path], list[Path]]:
+    """Return the KeePass databases and the subdirectories of directory,
+    skipping hidden ones."""
+    databases, subdirs = [], []
+    try:
+        children = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
+    except OSError:
+        return [], []
+    for child in children:
+        if child.name.startswith("."):
+            continue
+        try:
+            if child.is_dir():
+                subdirs.append(child)
+            elif child.suffix.lower() == ".kdbx" and child.is_file():
+                databases.append(child)
+        except OSError:
+            continue
+    return databases, subdirs
+
+
+def browse_directory(directory: Path):
+    """List a directory's databases, then '..', then its subdirectories."""
+    while True:
+        databases, subdirs = list_directory(directory)
+        targets = [(p.name, p) for p in databases]
+        if directory.parent != directory:
+            targets.append(("../", directory.parent))
+        targets += [(p.name + "/", p) for p in subdirs]
+        i = rofi("Browse", [label for label, _ in targets], mesg=tilde(directory))
+        if i is None:
+            return None
+        target = targets[i][1]
+        if target in databases:
+            return target
+        directory = target
+
+
+def browse():
+    """The directory browser; returns the chosen database or None."""
+    while True:
+        places = unique_dirs([*common_places(), *read_recent(RECENT_DIRECTORIES)])
+        i = rofi("Choose", [tilde(p) for p in places])
+        if i is None:
+            return None
+        database = browse_directory(places[i])
+        if database:
+            push_recent(RECENT_DIRECTORIES, str(database.parent))
+            return database
+
+
+def choose_database():
+    """Recent databases, newest first, then Choose…; returns a path or None."""
+    while True:
+        recent = [Path(p) for p in read_recent(RECENT_DATABASES) if Path(p).is_file()]
+        i = rofi("Database", [*map(tilde, recent), CHOOSE])
+        if i is None:
+            return None
+        if i < len(recent):
+            return recent[i]
+        database = browse()
+        if database:
+            return database
+
+
+# --- unlocking (specs.md §2.3) ----------------------------------------------
+
+
+@dataclass
+class Entry:
+    uuid: str
+    path: str  # "Group > Subgroup > Title", without the root group
+    title: str
+    username: str
+    url: str
+    password: str
+    notes: str
+
+
+def parse_export(xml: bytes) -> list[Entry]:
+    """Read the entries of a KeePass XML export, skipping entry history and
+    the recycle bin."""
+    root = ET.fromstring(xml)
+    recycle_bin = root.findtext("Meta/RecycleBinUUID")
+    entries = []
+
+    def walk(group, names):
+        for entry in group.findall("Entry"):
+            fields = {s.findtext("Key"): s.findtext("Value") or "" for s in entry.findall("String")}
+            title = fields.get("Title", "")
+            entries.append(Entry(
+                uuid=entry.findtext("UUID"),
+                path=" > ".join([*names, title or "(untitled)"]),
+                title=title,
+                username=fields.get("UserName", ""),
+                url=fields.get("URL", ""),
+                password=fields.get("Password", ""),
+                notes=fields.get("Notes", ""),
+            ))
+        for sub in group.findall("Group"):
+            if sub.findtext("UUID") != recycle_bin:
+                walk(sub, [*names, sub.findtext("Name") or ""])
+
+    top = root.find("Root/Group")
+    if top is not None:
+        walk(top, [])
+    return entries
+
+
+def open_database(database: Path, password: str):
+    """Decrypt the database into memory with keepassxc-cli. Returns
+    (entries, None) on success or (None, error message) on failure."""
+    proc = subprocess.run(
+        ["keepassxc-cli", "export", "--format", "xml", str(database)],
+        input=(password + "\n").encode(),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        lines = [
+            line for line in proc.stderr.decode(errors="replace").splitlines()
+            if line.strip() and not line.startswith("Enter password")
+        ]
+        return None, lines[0] if lines else "Could not open the database."
+    return parse_export(proc.stdout), None
+
+
+def unlock(database: Path):
+    """Prompt for the master password until it works. Returns (entries,
+    password), None to go back, or raises Quit if the user aborts."""
+    while True:
+        password = rofi("Password", password=True, mesg=tilde(database))
+        if password is None:
+            return None
+        entries, error = open_database(database, password)
+        if entries is not None:
+            push_recent(RECENT_DATABASES, str(database))
+            return entries, password
+        if rofi("Unlock failed", ["Try again", "Abort"], mesg=error) != 0:
+            raise Quit
+
+
+# --- encrypted entry last-use times (specs.md §3.2) -------------------------
+
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(
+        password.encode(), salt=salt, n=2**15, r=8, p=1, maxmem=64 * 2**20, dklen=32
+    )
+
+
+class UsageLog:
+    """When each entry was last used, kept in a per-database file encrypted
+    with the database's master password."""
+
+    AAD = b"roke-usage-v1"
+
+    def __init__(self, database: Path, password: str):
+        name = hashlib.sha256(str(database.absolute()).encode()).hexdigest()
+        self.file = config_dir() / "cache" / name
+        try:
+            self.times = self._load(password)
+        except FileNotFoundError:
+            self._start(password)
+        except (InvalidTag, ValueError, KeyError, TypeError):
+            # The file does not decrypt with the password that just unlocked
+            # the database, so the master password changed: start over.
+            self.file.unlink(missing_ok=True)
+            self._start(password)
+
+    def _load(self, password: str) -> dict:
+        blob = json.loads(self.file.read_bytes())
+        self.salt = base64.b64decode(blob["salt"])
+        self.key = derive_key(password, self.salt)
+        plain = AESGCM(self.key).decrypt(
+            base64.b64decode(blob["nonce"]), base64.b64decode(blob["data"]), self.AAD
+        )
+        return json.loads(plain)
+
+    def _start(self, password: str) -> None:
+        self.salt = os.urandom(16)
+        self.key = derive_key(password, self.salt)
+        self.times = {}
+
+    def last_used(self, entry: Entry) -> float:
+        return self.times.get(entry.uuid, 0)
+
+    def touch(self, entry: Entry) -> None:
+        self.times[entry.uuid] = time.time()
+        nonce = os.urandom(12)
+        data = AESGCM(self.key).encrypt(nonce, json.dumps(self.times).encode(), self.AAD)
+        write_atomic(self.file, json.dumps({
+            "version": 1,
+            "salt": base64.b64encode(self.salt).decode(),
+            "nonce": base64.b64encode(nonce).decode(),
+            "data": base64.b64encode(data).decode(),
+        }).encode())
+
+
+# --- entries and actions (specs.md §2.4, §2.5) ------------------------------
+
+
+def pick_entry(database: Path, entries: list[Entry], usage: UsageLog):
+    """List entries by last use; filtering also matches username and URL."""
+    entries = sorted(entries, key=lambda e: e.path.casefold())
+    entries.sort(key=usage.last_used, reverse=True)
+    i = rofi(
+        database.stem,
+        [e.path for e in entries],
+        meta=[f"{e.username} {e.url}" for e in entries],
+    )
+    return None if i is None else entries[i]
+
+
+def autotype(text: str) -> None:
+    if shutil.which("dotool"):
+        cmd = ["dotool"]
+        script = f"typedelay {AUTOTYPE_KEY_DELAY_MS}\ntype {text}\n"
+    elif shutil.which("xdotool"):
+        cmd = ["xdotool", "type", "--delay", str(AUTOTYPE_KEY_DELAY_MS), "--file", "-"]
+        script = text
+    else:
+        raise Failure("dotool is not installed.")
+    # Start the typist before the delay so dotool's virtual keyboard is ready
+    # by the time it ends. The text goes over stdin, never on a command line.
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
+    time.sleep(AUTOTYPE_START_DELAY_MS / 1000)
+    proc.communicate(script)
+    if proc.returncode != 0:
+        raise Failure(f"{cmd[0]} failed to type the password.")
+
+
+def copy_to_clipboard(text: str) -> None:
+    require("xclip")
+    subprocess.run(
+        ["xclip", "-selection", "clipboard"],
+        input=text, text=True, stdout=subprocess.DEVNULL, check=True,
+    )
+
+
+def view_notes(entry: Entry) -> None:
+    """Show the notes through rofi's stdin, so no file is ever created."""
+    rofi("Notes", entry.notes.splitlines() or ["(no notes)"], mesg=entry.path)
+
+
+def run_actions(entry: Entry, usage: UsageLog) -> bool:
+    """The entry's action menu; returns True once the password was used."""
+    while True:
+        i = rofi("Action", ACTIONS, mesg=entry.path)
+        if i is None:
+            return False
+        if i == 0:
+            autotype(entry.password)
+        elif i == 1:
+            copy_to_clipboard(entry.password)
+        else:
+            view_notes(entry)
+        usage.touch(entry)
+        if i in (0, 1):
+            return True
+
+
+def main() -> int:
+    os.umask(0o077)
+    try:
+        require("rofi")
+        require("keepassxc-cli")
+        while (database := choose_database()) is not None:
+            unlocked = unlock(database)
+            if unlocked is None:
+                continue
+            entries, password = unlocked
+            usage = UsageLog(database, password)
+            while (entry := pick_entry(database, entries, usage)) is not None:
+                if run_actions(entry, usage):
+                    return 0
+        return 0
+    except Quit:
+        return 1
+    except Failure as e:
+        show_error(str(e))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
