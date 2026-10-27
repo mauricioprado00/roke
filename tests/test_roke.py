@@ -157,9 +157,9 @@ class MenuTest(TempHome):
         self.exclusions = roke.Exclusions(self.db)
 
     def entry_rows(self):
-        with mock.patch.object(roke, "rofi", return_value=None) as rofi:
+        with mock.patch.object(roke.ui, "choose", return_value=None) as choose:
             roke.pick_entry(self.db, self.root, self.usage, self.exclusions)
-        return rofi.call_args.args[1]
+        return [roke.plain(row) for row in choose.call_args.args[1]]
 
     def test_entry_list(self):
         self.assertEqual(self.entry_rows(), ["Navigate groups", "Bank", "Gmail  ·  Work > Mail"])
@@ -172,9 +172,9 @@ class MenuTest(TempHome):
     def test_navigate(self):
         # root -> Work -> Exclude -> Mail -> Escape -> .. -> Escape
         answers = iter([1, 1, 2, None, 0, None])
-        with mock.patch.object(roke, "rofi", side_effect=lambda *a, **k: next(answers)) as rofi:
+        with mock.patch.object(roke.ui, "choose", side_effect=lambda *a, **k: next(answers)) as choose:
             self.assertFalse(roke.navigate(self.root, self.usage, self.exclusions))
-        menus = [(c.args[1], c.kwargs["mesg"]) for c in rofi.call_args_list]
+        menus = [([roke.plain(r) for r in c.args[1]], c.kwargs["mesg"]) for c in choose.call_args_list]
         self.assertEqual(menus, [
             (["..", "Work >", "Bank"], "Root"),
             (["..", "Exclude group", "Mail >"], "Work"),
@@ -184,6 +184,52 @@ class MenuTest(TempHome):
             (["..", "Work >", "Bank"], "Root"),
         ])
         self.assertTrue(self.exclusions.hides(("Work", "Mail")))
+
+
+class TerminalUITest(unittest.TestCase):
+    def test_clean_strips_control_characters(self):
+        self.assertEqual(roke.TerminalUI.clean("a\tb\nc\x1b[31md\x00"), "a b c[31md")
+
+    def test_choose(self):
+        terminal = roke.TerminalUI()
+        terminal.color = True
+        result = subprocess.CompletedProcess([], 0, stdout="1\tignored\n")
+        with mock.patch.object(roke.subprocess, "run", return_value=result) as run:
+            index = terminal.choose(
+                "Pick", ["plain", [("Ti\x1btle", "title"), (" g", "group")]],
+                mesg="head", meta=["", "alice"], sort=True,
+            )
+        self.assertEqual(index, 1)
+        cmd, lines = run.call_args.args[0], run.call_args.kwargs["input"].split("\n")
+        self.assertEqual(lines, ["0\tplain\t", "1\t\033[1mTitle\033[0m\033[36m g\033[0m\t\033[2malice\033[0m"])
+        self.assertIn("--header", cmd)
+        self.assertEqual(cmd[cmd.index("--tiebreak") + 1], "begin,index")
+
+        result.returncode = 130
+        with mock.patch.object(roke.subprocess, "run", return_value=result):
+            self.assertIsNone(terminal.choose("Pick", ["a"]))
+
+
+class PickUITest(TempHome):
+    def pick(self, argv, program="roke", tty=True):
+        with mock.patch.object(roke.sys.stdin, "isatty", return_value=tty):
+            return type(roke.pick_ui(roke.parse_args(argv), program)).__name__
+
+    def test_pick_ui(self):
+        self.assertEqual(self.pick([]), "RofiUI")
+        self.assertEqual(self.pick([], program="fuzke", tty=False), "TerminalUI")
+        self.assertEqual(self.pick(["--cli"], tty=False), "TerminalUI")
+
+        with mock.patch("builtins.print"):
+            self.assertEqual(roke.main(["--default", "cli"]), 0)
+        self.assertEqual((self.tmp / ".config/roke/config").read_text(), "default=cli\n")
+        self.assertEqual(self.pick([]), "TerminalUI")
+        self.assertEqual(self.pick([], tty=False), "RofiUI")
+        self.assertEqual(self.pick(["--rofi"]), "RofiUI")
+
+        with mock.patch("builtins.print"):
+            roke.main(["--default", "rofi"])
+        self.assertEqual(self.pick([]), "RofiUI")
 
 
 class StateTest(TempHome):

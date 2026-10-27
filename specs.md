@@ -7,13 +7,14 @@ KeePass database, fuzzy-search or browse its entries, and then either
 auto-type a password into the focused window, copy it to the clipboard, or
 read the entry's notes.
 
-It is a single Python script, `roke`.
+It is a single Python script, `roke`. Its terminal version, `fuzke` (§4), is
+the same script installed under a second name; it uses fzf instead of rofi.
 
 ### 1.1 External dependencies
 
 | Purpose          | Tool                                               |
 | ---------------- | -------------------------------------------------- |
-| Menu / prompt UI | `rofi` (1.7.5 or later)                            |
+| Menu / prompt UI | `rofi` (1.7.5 or later); `fzf` for fuzke           |
 | Decryption       | `keepassxc-cli`                                    |
 | Runtime          | `python3` with `cryptography` (`python3-cryptography`) |
 | Auto-type        | `dotool`; `xdotool` is used when `dotool` is missing |
@@ -21,9 +22,9 @@ It is a single Python script, `roke`.
 
 ### 1.2 Installation
 
-`make install` copies the script to `$(PREFIX)/bin/roke` (`PREFIX` defaults to
-`/usr/local`; `DESTDIR` is honoured). `make uninstall` removes it and
-`make test` runs the unit tests.
+`make install` copies the script to `$(PREFIX)/bin/roke` and links
+`$(PREFIX)/bin/fuzke` to it (`PREFIX` defaults to `/usr/local`; `DESTDIR` is
+honoured). `make uninstall` removes both and `make test` runs the unit tests.
 
 ## 2. User flow
 
@@ -126,7 +127,7 @@ password roke exits; after View notes it returns to the action menu.
 
 After a 500 ms start delay, which lets focus return to the target window, the
 password is typed with a 25 ms delay between characters. These are KeePassXC's
-default Auto-Type delays.
+default Auto-Type delays. fuzke asks for the start delay instead (§4.3).
 
 `dotool` is used when installed, otherwise `xdotool`. The typing program is
 started before the delay, so that dotool's virtual keyboard is ready, and the
@@ -191,6 +192,7 @@ All state lives in `~/.config/roke/` (`$XDG_CONFIG_HOME/roke/`):
 | `recent-directories`   | directories, newest first, at most 30        | plain text |
 | `excluded-groups`      | one hash per excluded group                  | salted hash |
 | `salt`                 | 32 random bytes, hex                         | plain text |
+| `config`               | `key=value` settings, e.g. `default=cli`     | plain text |
 | `cache/<id>`           | entry last-use times for one database        | encrypted  |
 
 **Excluded groups:** each line is
@@ -211,3 +213,51 @@ and are in use, and would amount to a usage log.
 **Master password change:** if the database unlocks but its last-use file
 cannot be decrypted with that password, the master password has changed. The
 file is discarded and a new one is started.
+
+## 4. Terminal version (fuzke)
+
+### 4.1 Starting it
+
+The terminal version runs when roke is started:
+
+- as `fuzke`;
+- as `roke --cli`;
+- as plain `roke` from a terminal, after `roke --default cli`.
+
+`roke --default cli` saves `default=cli` in `~/.config/roke/config` (§3.2), and
+`roke --default rofi` switches back. With `default=cli`, roke uses the terminal
+version only when its standard input is a terminal; started from a
+window-manager key binding or launcher, it still uses rofi. `roke --rofi`
+forces rofi for one run.
+
+### 4.2 Differences from the rofi version
+
+The flow, menus, ordering and storage are the same as §2 and §3, except:
+
+- **Menus** are full-screen fzf finders, coloured with ANSI codes (database
+  files green, directories and groups blue, titles bold, group paths cyan,
+  special rows such as Choose… and Navigate groups magenta). Setting
+  `NO_COLOR` turns colours off. fzf uses the terminal's alternate screen, so
+  menus, including notes, do not stay in the scrollback.
+- **Hidden search text:** fzf 0.44 cannot search text it does not show, so the
+  entry list shows the username and URL dimmed after each row.
+- **Ranking while filtering:** fzf's own scoring is used. Among equally scored
+  matches, those nearer the start of the row win, and then the list order
+  (§2.4). As in rofi, a title match usually, but not always, beats a group
+  match.
+- **Master password** is read from the terminal without echo. Ctrl-C or
+  Ctrl-D at the prompt goes back to the database list.
+- **Messages:** after copying or typing a password, a confirmation is printed.
+  Errors are printed in red instead of shown in rofi.
+- **Untrusted text:** control characters are removed from entry text before
+  it is displayed, so an entry cannot inject terminal escape sequences.
+
+### 4.3 Autotype delay
+
+Choosing **Autotype** first opens a menu asking how long to wait before
+typing: 1, 2, 3, 5, 10, 15 or 30 seconds. Escape returns to the action menu.
+
+During the wait, a countdown is shown on the terminal while the user switches
+to the target window. Ctrl-C cancels the autotype and returns to the action
+menu, and nothing is typed. Typing then proceeds as in §2.5.1, with the same
+25 ms delay between characters.
