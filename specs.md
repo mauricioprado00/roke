@@ -60,10 +60,15 @@ Once the database is open, all entries are listed.
 
 - **Ordering:** by last use, most recent first. An entry counts as used
   whenever any of its actions (§2.5) is performed.
-- **Display format:** the full group path followed by the title, e.g.
-  `Group > Subgroup > Subgroup > Title`.
+- **Display format:** the title followed by its group path, e.g.
+  `Title  ·  Group > Subgroup > Subgroup`.
 - **Filtering:** typed input fuzzy-matches against the entry's **title**,
   **URL** and **username**.
+- **Ranking while filtering:** entries whose title matches come first.
+  rofi's fuzzy sort scores only the displayed text and favours matches near
+  its start, which is why the title leads the row. Matches in the group path
+  rank below title matches, and matches only in the URL or username rank last.
+  A weak fuzzy title match can still rank below a strong group match.
 
 ### 2.5 Entry actions
 

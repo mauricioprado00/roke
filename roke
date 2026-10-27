@@ -88,10 +88,13 @@ def clean(text: str) -> str:
     return text.replace("\n", " ").replace("\0", "").replace("\x1f", "")
 
 
-def rofi(prompt, rows=(), *, mesg=None, meta=None, password=False):
+def rofi(prompt, rows=(), *, mesg=None, meta=None, password=False, sort=False):
     """Show a rofi menu over stdin; nothing is passed on the command line or
     written to disk. Returns the selected row's index, or the typed text for
-    a password prompt, or None when the user presses Escape."""
+    a password prompt, or None when the user presses Escape.
+
+    With sort, matches are ranked by fzf score against the row text only
+    (never meta), ties keeping row order; an empty query keeps row order."""
     cmd = ["rofi", "-dmenu", "-i", "-p", prompt]
     if mesg:
         cmd += ["-mesg", html.escape(mesg)]
@@ -99,6 +102,8 @@ def rofi(prompt, rows=(), *, mesg=None, meta=None, password=False):
         cmd += ["-password", "-theme-str", "listview { enabled: false; }"]
     else:
         cmd += ["-format", "i", "-no-custom", "-matching", "fuzzy"]
+    if sort:
+        cmd += ["-sort", "-sorting-method", "fzf"]
     lines = []
     for i, row in enumerate(rows):
         line = clean(row)
@@ -226,12 +231,24 @@ def choose_database():
 @dataclass
 class Entry:
     uuid: str
-    path: str  # "Group > Subgroup > Title", without the root group
+    group: str  # "Group > Subgroup", without the root group
     title: str
     username: str
     url: str
     password: str
     notes: str
+
+    @property
+    def path(self) -> str:
+        """"Group > Subgroup > Title"."""
+        return " > ".join(filter(None, [self.group, self.title or "(untitled)"]))
+
+    @property
+    def label(self) -> str:
+        """The entry list row. The title comes first because rofi's sort
+        favours matches near the start of the row (specs.md §2.4)."""
+        title = self.title or "(untitled)"
+        return f"{title}  ·  {self.group}" if self.group else title
 
 
 def parse_export(xml: bytes) -> list[Entry]:
@@ -244,11 +261,10 @@ def parse_export(xml: bytes) -> list[Entry]:
     def walk(group, names):
         for entry in group.findall("Entry"):
             fields = {s.findtext("Key"): s.findtext("Value") or "" for s in entry.findall("String")}
-            title = fields.get("Title", "")
             entries.append(Entry(
                 uuid=entry.findtext("UUID"),
-                path=" > ".join([*names, title or "(untitled)"]),
-                title=title,
+                group=" > ".join(names),
+                title=fields.get("Title", ""),
                 username=fields.get("UserName", ""),
                 url=fields.get("URL", ""),
                 password=fields.get("Password", ""),
@@ -357,13 +373,15 @@ class UsageLog:
 
 
 def pick_entry(database: Path, entries: list[Entry], usage: UsageLog):
-    """List entries by last use; filtering also matches username and URL."""
-    entries = sorted(entries, key=lambda e: e.path.casefold())
+    """List entries by last use; filtering also matches username and URL,
+    which rank below matches in the visible text."""
+    entries = sorted(entries, key=lambda e: e.label.casefold())
     entries.sort(key=usage.last_used, reverse=True)
     i = rofi(
         database.stem,
-        [e.path for e in entries],
+        [e.label for e in entries],
         meta=[f"{e.username} {e.url}" for e in entries],
+        sort=True,
     )
     return None if i is None else entries[i]
 

@@ -72,10 +72,11 @@ class ParseExportTest(unittest.TestCase):
     def test_entries(self):
         entries = {e.title: e for e in roke.parse_export(EXPORT)}
         self.assertEqual(set(entries), {"Bank", "Gmail"})  # no history, no recycle bin
-        self.assertEqual(entries["Bank"].path, "Bank")
+        self.assertEqual((entries["Bank"].path, entries["Bank"].label), ("Bank", "Bank"))
         self.assertEqual(entries["Bank"].password, "new")
         gmail = entries["Gmail"]
         self.assertEqual(gmail.path, "Work > Mail > Gmail")
+        self.assertEqual(gmail.label, "Gmail  ·  Work > Mail")
         self.assertEqual((gmail.username, gmail.url), ("alice", "https://mail.example.com"))
         self.assertEqual(gmail.notes, "line one\nline two")
 
