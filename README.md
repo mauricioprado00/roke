@@ -24,7 +24,8 @@ make install PREFIX=~/.local      # ~/.local/bin/roke and fuzke, no sudo
 ## Usage
 
 Run `roke`, typically from a window-manager key binding. Escape goes back one
-menu; at the database list it exits.
+menu; at the database list it exits. `roke path/to/file.kdbx` opens that
+database straight away and adds it to the recent databases.
 
 `fuzke` (or `roke --cli`) is the terminal version: coloured fzf menus, and
 autotype asks how many seconds to wait, with a countdown. `roke --default cli`

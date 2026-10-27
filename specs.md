@@ -45,6 +45,12 @@ The first menu lists recently opened databases that still exist, most recent
 first. The final item is always **Choose…**, which opens the directory
 browser (§2.2).
 
+**From the command line:** `roke <file.kdbx>` (likewise `fuzke <file.kdbx>`)
+skips this menu and goes straight to unlocking (§2.3). The database is added
+to the recent databases immediately, before it is unlocked. A path that is not
+an existing file is reported as an error and roke exits. Going back from the
+password prompt or the entry list leads to this menu.
+
 ### 2.2 Directory browser
 
 **Choose…** first shows a list of starting places, in this order:

@@ -232,6 +232,34 @@ class PickUITest(TempHome):
         self.assertEqual(self.pick([]), "RofiUI")
 
 
+class DatabaseArgumentTest(TempHome):
+    def run_main(self, argv):
+        with mock.patch.object(roke, "require"), \
+                mock.patch.object(roke, "unlock", return_value=None) as unlock, \
+                mock.patch.object(roke, "choose_database", return_value=None), \
+                mock.patch.object(roke.RofiUI, "error") as error:
+            code = roke.main(["--rofi", *argv])
+        return code, unlock, error
+
+    def test_opens_and_records_the_database(self):
+        db = self.tmp / "demo.kdbx"
+        db.touch()
+        roke.push_recent("recent-databases", "/other.kdbx")
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, ROKE.parent)
+        code, unlock, _ = self.run_main(["demo.kdbx"])
+        self.assertEqual(code, 0)
+        unlock.assert_called_once_with(db)
+        self.assertEqual(roke.read_recent("recent-databases"), [str(db), "/other.kdbx"])
+
+    def test_missing_database(self):
+        code, unlock, error = self.run_main([str(self.tmp / "missing.kdbx")])
+        self.assertEqual(code, 1)
+        unlock.assert_not_called()
+        self.assertIn("does not exist", error.call_args.args[0])
+        self.assertEqual(roke.read_recent("recent-databases"), [])
+
+
 class StateTest(TempHome):
     def test_push_recent(self):
         for item in ("a", "b", "a", "c"):

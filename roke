@@ -689,6 +689,10 @@ def parse_args(argv):
         "--default", choices=("cli", "rofi"),
         help="save which version roke uses when started from a terminal, then exit",
     )
+    parser.add_argument(
+        "database", nargs="?",
+        help="a .kdbx file to open straight away; it is added to the recent databases",
+    )
     return parser.parse_args(argv)
 
 
@@ -719,7 +723,15 @@ def main(argv=None) -> int:
     try:
         require(ui.command)
         require("keepassxc-cli")
-        while (database := choose_database()) is not None:
+        requested = None
+        if args.database:
+            # Opened from the command line: recent right away (§2.1).
+            requested = Path(os.path.abspath(args.database))
+            if not requested.is_file():
+                raise Failure(f"{requested} does not exist.")
+            push_recent(RECENT_DATABASES, str(requested))
+        while (database := requested or choose_database()) is not None:
+            requested = None  # going back from here leads to the database list
             unlocked = unlock(database)
             if unlocked is None:
                 continue
