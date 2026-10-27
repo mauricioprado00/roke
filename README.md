@@ -26,9 +26,14 @@ make install PREFIX=~/.local      # ~/.local/bin/roke, no sudo
 Run `roke`, typically from a window-manager key binding. Escape goes back one
 menu; at the database list it exits.
 
+After unlocking, recently used entries come first, then **Navigate groups**,
+which browses the group tree and can exclude a group from the entry list,
+then the remaining entries.
+
 State lives in `~/.config/roke/`: the recent databases and directories in
-plain text, and each database's entry last-use times in `cache/`, encrypted
-with that database's master password.
+plain text, excluded groups as salted hashes, and each database's entry
+last-use times in `cache/`, encrypted with that database's master password.
+See [specs.md](specs.md) §3.2.
 
 ## Tests
 

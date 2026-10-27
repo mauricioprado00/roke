@@ -6,6 +6,7 @@ Escape always goes back one menu; at the database list it exits.
 
 import base64
 import hashlib
+import hmac
 import html
 import json
 import os
@@ -14,7 +15,7 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
@@ -27,8 +28,11 @@ AUTOTYPE_KEY_DELAY_MS = 25
 RECENT_DATABASES = "recent-databases"
 RECENT_DIRECTORIES = "recent-directories"
 RECENT_LIMIT = 30
+EXCLUDED_GROUPS = "excluded-groups"
+SALT = "salt"
 
 CHOOSE = "Choose…"
+NAVIGATE = "Navigate groups"
 ACTIONS = ("Autotype", "Copy password", "View notes")
 
 # XDG user directories offered as starting places, with their usual names.
@@ -231,12 +235,17 @@ def choose_database():
 @dataclass
 class Entry:
     uuid: str
-    group: str  # "Group > Subgroup", without the root group
+    groups: tuple[str, ...]  # group names from below the root group down
     title: str
     username: str
     url: str
     password: str
     notes: str
+
+    @property
+    def group(self) -> str:
+        """"Group > Subgroup"."""
+        return " > ".join(self.groups)
 
     @property
     def path(self) -> str:
@@ -251,38 +260,50 @@ class Entry:
         return f"{title}  ·  {self.group}" if self.group else title
 
 
-def parse_export(xml: bytes) -> list[Entry]:
-    """Read the entries of a KeePass XML export, skipping entry history and
-    the recycle bin."""
+@dataclass
+class Group:
+    names: tuple[str, ...]  # group names from below the root; () is the root
+    groups: list["Group"] = field(default_factory=list)
+    entries: list[Entry] = field(default_factory=list)
+
+    def walk(self):
+        """Every entry in this group and its subgroups."""
+        yield from self.entries
+        for sub in self.groups:
+            yield from sub.walk()
+
+
+def parse_export(xml: bytes) -> Group:
+    """Read the group tree of a KeePass XML export, skipping entry history
+    and the recycle bin."""
     root = ET.fromstring(xml)
     recycle_bin = root.findtext("Meta/RecycleBinUUID")
-    entries = []
 
-    def walk(group, names):
-        for entry in group.findall("Entry"):
+    def read_group(element, names):
+        group = Group(names)
+        for entry in element.findall("Entry"):
             fields = {s.findtext("Key"): s.findtext("Value") or "" for s in entry.findall("String")}
-            entries.append(Entry(
+            group.entries.append(Entry(
                 uuid=entry.findtext("UUID"),
-                group=" > ".join(names),
+                groups=names,
                 title=fields.get("Title", ""),
                 username=fields.get("UserName", ""),
                 url=fields.get("URL", ""),
                 password=fields.get("Password", ""),
                 notes=fields.get("Notes", ""),
             ))
-        for sub in group.findall("Group"):
+        for sub in element.findall("Group"):
             if sub.findtext("UUID") != recycle_bin:
-                walk(sub, [*names, sub.findtext("Name") or ""])
+                group.groups.append(read_group(sub, (*names, sub.findtext("Name") or "")))
+        return group
 
     top = root.find("Root/Group")
-    if top is not None:
-        walk(top, [])
-    return entries
+    return read_group(top, ()) if top is not None else Group(())
 
 
 def open_database(database: Path, password: str):
     """Decrypt the database into memory with keepassxc-cli. Returns
-    (entries, None) on success or (None, error message) on failure."""
+    (root group, None) on success or (None, error message) on failure."""
     proc = subprocess.run(
         ["keepassxc-cli", "export", "--format", "xml", str(database)],
         input=(password + "\n").encode(),
@@ -298,16 +319,16 @@ def open_database(database: Path, password: str):
 
 
 def unlock(database: Path):
-    """Prompt for the master password until it works. Returns (entries,
+    """Prompt for the master password until it works. Returns (root group,
     password), None to go back, or raises Quit if the user aborts."""
     while True:
         password = rofi("Password", password=True, mesg=tilde(database))
         if password is None:
             return None
-        entries, error = open_database(database, password)
-        if entries is not None:
+        root, error = open_database(database, password)
+        if root is not None:
             push_recent(RECENT_DATABASES, str(database))
-            return entries, password
+            return root, password
         if rofi("Unlock failed", ["Try again", "Abort"], mesg=error) != 0:
             raise Quit
 
@@ -369,21 +390,91 @@ class UsageLog:
         }).encode())
 
 
+# --- excluded groups (specs.md §2.6, §3.2) ----------------------------------
+
+
+class Exclusions:
+    """Groups hidden from the entry list. Only salted hashes of (database
+    path, group path) are stored, so the file survives master password
+    changes without naming any group."""
+
+    def __init__(self, database: Path):
+        self.database = str(database.absolute())
+        salt_file = config_dir() / SALT
+        try:
+            self.salt = bytes.fromhex(salt_file.read_text().strip())
+        except (FileNotFoundError, ValueError):
+            self.salt = os.urandom(32)
+            write_atomic(salt_file, (self.salt.hex() + "\n").encode())
+        self.hashes = set(read_recent(EXCLUDED_GROUPS))
+
+    def _hash(self, names: tuple[str, ...]) -> str:
+        message = json.dumps([self.database, *names]).encode()
+        return hmac.new(self.salt, message, hashlib.sha256).hexdigest()
+
+    def excludes(self, names: tuple[str, ...]) -> bool:
+        """Whether this group itself is excluded."""
+        return bool(names) and self._hash(names) in self.hashes
+
+    def hides(self, names: tuple[str, ...]) -> bool:
+        """Whether this group or one of its ancestors is excluded."""
+        return any(self.excludes(names[:i]) for i in range(1, len(names) + 1))
+
+    def toggle(self, names: tuple[str, ...]) -> None:
+        self.hashes ^= {self._hash(names)}
+        write_atomic(config_dir() / EXCLUDED_GROUPS, "".join(h + "\n" for h in sorted(self.hashes)).encode())
+
+
 # --- entries and actions (specs.md §2.4, §2.5) ------------------------------
 
 
-def pick_entry(database: Path, entries: list[Entry], usage: UsageLog):
-    """List entries by last use; filtering also matches username and URL,
-    which rank below matches in the visible text."""
-    entries = sorted(entries, key=lambda e: e.label.casefold())
-    entries.sort(key=usage.last_used, reverse=True)
+def pick_entry(database: Path, root: Group, usage: UsageLog, exclusions: Exclusions):
+    """The entry list: used entries by last use, then Navigate groups, then
+    the never-used entries by name, all without excluded groups. Filtering
+    also matches username and URL, which rank below the visible text.
+    Returns an Entry, NAVIGATE, or None."""
+    entries = [e for e in root.walk() if not exclusions.hides(e.groups)]
+    used = sorted((e for e in entries if usage.last_used(e)), key=usage.last_used, reverse=True)
+    unused = sorted((e for e in entries if not usage.last_used(e)), key=lambda e: e.label.casefold())
+    rows = [*used, NAVIGATE, *unused]
     i = rofi(
         database.stem,
-        [e.label for e in entries],
-        meta=[f"{e.username} {e.url}" for e in entries],
+        [NAVIGATE if row is NAVIGATE else row.label for row in rows],
+        meta=["" if row is NAVIGATE else f"{row.username} {row.url}" for row in rows],
         sort=True,
     )
-    return None if i is None else entries[i]
+    return None if i is None else rows[i]
+
+
+def navigate(group: Group, usage: UsageLog, exclusions: Exclusions) -> bool:
+    """Browse a group: '..', the exclude/include toggle (not for the root),
+    its subgroups, then its entries. Returns True once a password was used."""
+    while True:
+        rows = [("..", None)]
+        if group.names:
+            toggle = "Include group" if exclusions.excludes(group.names) else "Exclude group"
+            rows.append((toggle, "toggle"))
+        rows += [(sub.names[-1] + " >", sub) for sub in group.groups]
+        rows += [(entry.title or "(untitled)", entry) for entry in group.entries]
+        mesg = " > ".join(group.names) or "Root"
+        if exclusions.hides(group.names):
+            mesg += " (excluded from the entry list)"
+        i = rofi(
+            "Groups",
+            [label for label, _ in rows],
+            mesg=mesg,
+            meta=[f"{t.username} {t.url}" if isinstance(t, Entry) else "" for _, t in rows],
+        )
+        target = None if i is None else rows[i][1]
+        if target is None:
+            return False
+        if target == "toggle":
+            exclusions.toggle(group.names)
+        elif isinstance(target, Group):
+            if navigate(target, usage, exclusions):
+                return True
+        elif run_actions(target, usage):
+            return True
 
 
 def autotype(text: str) -> None:
@@ -443,10 +534,15 @@ def main() -> int:
             unlocked = unlock(database)
             if unlocked is None:
                 continue
-            entries, password = unlocked
+            root, password = unlocked
             usage = UsageLog(database, password)
-            while (entry := pick_entry(database, entries, usage)) is not None:
-                if run_actions(entry, usage):
+            exclusions = Exclusions(database)
+            while (choice := pick_entry(database, root, usage, exclusions)) is not None:
+                if choice is NAVIGATE:
+                    done = navigate(root, usage, exclusions)
+                else:
+                    done = run_actions(choice, usage)
+                if done:
                     return 0
         return 0
     except Quit:

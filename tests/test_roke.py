@@ -70,8 +70,12 @@ class TempHome(unittest.TestCase):
 
 class ParseExportTest(unittest.TestCase):
     def test_entries(self):
-        entries = {e.title: e for e in roke.parse_export(EXPORT)}
-        self.assertEqual(set(entries), {"Bank", "Gmail"})  # no history, no recycle bin
+        root = roke.parse_export(EXPORT)
+        self.assertEqual([g.names for g in root.groups], [("Work",)])  # no recycle bin
+        self.assertEqual([g.names for g in root.groups[0].groups], [("Work", "Mail")])
+        self.assertEqual([e.title for e in root.entries], ["Bank"])
+        entries = {e.title: e for e in root.walk()}
+        self.assertEqual(set(entries), {"Bank", "Gmail"})  # no history
         self.assertEqual((entries["Bank"].path, entries["Bank"].label), ("Bank", "Bank"))
         self.assertEqual(entries["Bank"].password, "new")
         gmail = entries["Gmail"]
@@ -91,12 +95,12 @@ class OpenDatabaseTest(TempHome):
         run("db-create", "-p", str(db), stdin="pw\npw\n")
         run("add", "-q", "-u", "bob", "-p", str(db), "Bank", stdin="pw\nsecret\n")
 
-        entries, error = roke.open_database(db, "pw")
+        root, error = roke.open_database(db, "pw")
         self.assertIsNone(error)
-        self.assertEqual([(e.path, e.password) for e in entries], [("Bank", "secret")])
+        self.assertEqual([(e.path, e.password) for e in root.walk()], [("Bank", "secret")])
 
-        entries, error = roke.open_database(db, "wrong")
-        self.assertIsNone(entries)
+        root, error = roke.open_database(db, "wrong")
+        self.assertIsNone(root)
         self.assertIn("Invalid credentials", error)
 
 
@@ -104,7 +108,7 @@ class UsageLogTest(TempHome):
     def setUp(self):
         super().setUp()
         self.db = self.tmp / "test.kdbx"
-        self.entry = roke.parse_export(EXPORT)[0]
+        self.entry = next(roke.parse_export(EXPORT).walk())
 
     def test_round_trip_is_encrypted(self):
         roke.UsageLog(self.db, "pw").touch(self.entry)
@@ -121,6 +125,65 @@ class UsageLogTest(TempHome):
         self.assertEqual(list((self.tmp / ".config/roke/cache").iterdir()), [])
         log.touch(self.entry)
         self.assertGreater(roke.UsageLog(self.db, "changed").last_used(self.entry), 0)
+
+
+class ExclusionsTest(TempHome):
+    def test_toggle_persists_as_salted_hashes(self):
+        db = self.tmp / "test.kdbx"
+        roke.Exclusions(db).toggle(("Work",))
+        exclusions = roke.Exclusions(db)
+        self.assertTrue(exclusions.excludes(("Work",)))
+        self.assertFalse(exclusions.excludes(("Work", "Mail")))
+        self.assertTrue(exclusions.hides(("Work", "Mail")))
+        self.assertFalse(exclusions.hides(()))
+        self.assertFalse(roke.Exclusions(self.tmp / "other.kdbx").hides(("Work",)))
+
+        config = self.tmp / ".config/roke"
+        stored = (config / "excluded-groups").read_text()
+        self.assertNotIn("Work", stored)
+        self.assertEqual(len(stored.split()), 1)
+        self.assertEqual(len(bytes.fromhex((config / "salt").read_text())), 32)
+
+        exclusions.toggle(("Work",))
+        self.assertFalse(roke.Exclusions(db).hides(("Work", "Mail")))
+
+
+class MenuTest(TempHome):
+    def setUp(self):
+        super().setUp()
+        self.db = self.tmp / "test.kdbx"
+        self.root = roke.parse_export(EXPORT)
+        self.usage = roke.UsageLog(self.db, "pw")
+        self.exclusions = roke.Exclusions(self.db)
+
+    def entry_rows(self):
+        with mock.patch.object(roke, "rofi", return_value=None) as rofi:
+            roke.pick_entry(self.db, self.root, self.usage, self.exclusions)
+        return rofi.call_args.args[1]
+
+    def test_entry_list(self):
+        self.assertEqual(self.entry_rows(), ["Navigate groups", "Bank", "Gmail  ·  Work > Mail"])
+        gmail = self.root.groups[0].groups[0].entries[0]
+        self.usage.touch(gmail)
+        self.assertEqual(self.entry_rows(), ["Gmail  ·  Work > Mail", "Navigate groups", "Bank"])
+        self.exclusions.toggle(("Work",))
+        self.assertEqual(self.entry_rows(), ["Navigate groups", "Bank"])
+
+    def test_navigate(self):
+        # root -> Work -> Exclude -> Mail -> Escape -> .. -> Escape
+        answers = iter([1, 1, 2, None, 0, None])
+        with mock.patch.object(roke, "rofi", side_effect=lambda *a, **k: next(answers)) as rofi:
+            self.assertFalse(roke.navigate(self.root, self.usage, self.exclusions))
+        menus = [(c.args[1], c.kwargs["mesg"]) for c in rofi.call_args_list]
+        self.assertEqual(menus, [
+            (["..", "Work >", "Bank"], "Root"),
+            (["..", "Exclude group", "Mail >"], "Work"),
+            (["..", "Include group", "Mail >"], "Work (excluded from the entry list)"),
+            (["..", "Exclude group", "Gmail"], "Work > Mail (excluded from the entry list)"),
+            (["..", "Include group", "Mail >"], "Work (excluded from the entry list)"),
+            (["..", "Work >", "Bank"], "Root"),
+        ])
+        self.assertTrue(self.exclusions.hides(("Work", "Mail")))
 
 
 class StateTest(TempHome):
