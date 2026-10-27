@@ -12,6 +12,15 @@ The full behaviour is in [specs.md](specs.md).
 - `dotool` for auto-type; `xdotool` is used when `dotool` is missing
 - `xclip` for copying
 
+## Install
+
+```sh
+sudo make install                 # /usr/local/bin/roke
+make install PREFIX=~/.local      # ~/.local/bin/roke, no sudo
+```
+
+`make uninstall` (with the same `PREFIX`) removes it.
+
 ## Usage
 
 Run `roke`, typically from a window-manager key binding. Escape goes back one
@@ -24,5 +33,5 @@ with that database's master password.
 ## Tests
 
 ```sh
-python3 -m unittest discover tests
+make test
 ```
